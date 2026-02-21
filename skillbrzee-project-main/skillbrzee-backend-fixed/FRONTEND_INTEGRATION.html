@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<!--
+  SKILLBRZEE FRONTEND — Backend-Connected Version
+  Changes from original:
+  1. API_BASE auto-detects backend at localhost:5000
+  2. Admin panel now also syncs files FROM the backend API
+  3. Public resources loaded from /api/files/public
+  4. Admin upload pushes to /api/files/add-url (or /api/files/upload)
+  5. Admin is seeded via scripts/seed-admin.js on the backend
+  
+  HOW TO USE:
+  1. npm install && node scripts/seed-admin.js in skillbrzee-backend/
+  2. npm start  (backend runs on :5000)
+  3. Serve THIS file on any port (e.g. python -m http.server 3000)
+  4. Open http://localhost:3000
+  
+  NOTE: The full index.html is unchanged EXCEPT for the JS block below.
+  Replace the top <script> block in your index.html with the one below.
+-->
+
+<!-- ═══════════════════════════════════════════════════════════
+     REPLACE YOUR EXISTING <script> BLOCK AT THE TOP OF index.html
+     (right after <body>) WITH THIS:
+══════════════════════════════════════════════════════════════ -->
+<script>
+  /* ── Admin credentials (used locally for panel access check) ── */
+  const ADMIN_CREDENTIALS = {
+    username: 'admin@skillbrzee.in',
+    password: 'Admin@Skillbrzee123',
+    name:     'Skillbrzee Admin',
+  };
+
+  /* ── API Base — auto-detects backend ── */
+  const API_BASE = (() => {
+    const forced = localStorage.getItem('sb_api_base');
+    if (forced) return forced.replace(/\/$/, '');
+    // If served on same port as backend
+    if (location?.port === '5000') return `${location.origin}/api`;
+    // Default: backend on localhost:5000
+    return 'http://localhost:5000/api';
+  })();
+
+  let authToken   = localStorage.getItem('sb_token') || null;
+  let currentUser = JSON.parse(localStorage.getItem('sb_user') || 'null');
+  let isAdminMode = false;
+
+  /* ── Resource store: syncs from backend, falls back to localStorage ── */
+  let resourceStore = JSON.parse(localStorage.getItem('sb_resources') || '[]');
+  let fakeUsers     = JSON.parse(localStorage.getItem('sb_fake_users') || '[]');
+
+  function saveResources() { localStorage.setItem('sb_resources', JSON.stringify(resourceStore)); }
+  function saveFakeUsers() { localStorage.setItem('sb_fake_users', JSON.stringify(fakeUsers)); }
+
+  function authHeaders(json = true) {
+    return {
+      ...(json ? { 'Content-Type': 'application/json' } : {}),
+      ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {}),
+    };
+  }
+  function isLoggedIn() { return !!authToken && !!currentUser; }
+  function saveAuth(token, user) {
+    authToken = token;
+    currentUser = user;
+    localStorage.setItem('sb_token', token);
+    localStorage.setItem('sb_user', JSON.stringify(user));
+  }
+  function clearAuth() {
+    authToken = null;
+    currentUser = null;
+    localStorage.removeItem('sb_token');
+    localStorage.removeItem('sb_user');
+  }
+
+  async function refreshUser() {
+    if (!authToken) return;
+    try {
+      const res  = await fetch(`${API_BASE}/auth/me`, { headers: authHeaders() });
+      if (!res.ok) { clearAuth(); updateNavAuth(); return; }
+      const data = await res.json();
+      currentUser = data.user;
+      localStorage.setItem('sb_user', JSON.stringify(currentUser));
+    } catch { /* offline fallback — keep cached user */ }
+  }
+
+  /* ── Load public resources from backend into resourceStore ── */
+  async function syncResourcesFromBackend() {
+    try {
+      const res  = await fetch(`${API_BASE}/files/public`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.files) && data.files.length > 0) {
+        // Merge: backend is source of truth; keep any local-only items too
+        const backendIds = new Set(data.files.map(f => String(f.id)));
+        const localOnly  = resourceStore.filter(r => !backendIds.has(String(r.id)));
+        resourceStore    = [...data.files, ...localOnly];
+        saveResources();
+      }
+    } catch { /* use localStorage fallback */ }
+  }
+
+  /* ── Admin: upload file or URL to backend ── */
+  async function adminSaveToBackend(payload, file) {
+    if (!authToken) return null;
+    try {
+      if (file) {
+        // Real file upload
+        const form = new FormData();
+        form.append('file',        file);
+        form.append('title',       payload.title);
+        form.append('category',    payload.category);
+        form.append('visibility',  payload.visibility);
+        form.append('description', payload.desc || '');
+        const res  = await fetch(`${API_BASE}/files/upload`, {
+          method:  'POST',
+          headers: { 'Authorization': `Bearer ${authToken}` },
+          body:    form,
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.file;
+      } else if (payload.url) {
+        // URL-only
+        const res  = await fetch(`${API_BASE}/files/add-url`, {
+          method:  'POST',
+          headers: authHeaders(),
+          body:    JSON.stringify({
+            title:       payload.title,
+            url:         payload.url,
+            category:    payload.category,
+            visibility:  payload.visibility,
+            description: payload.desc || '',
+          }),
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.file;
+      }
+    } catch { return null; }
+    return null;
+  }
+
+  /* ── Admin: delete file from backend ── */
+  async function adminDeleteFromBackend(id) {
+    if (!authToken) return;
+    try {
+      await fetch(`${API_BASE}/files/${id}`, {
+        method:  'DELETE',
+        headers: authHeaders(),
+      });
+    } catch { /* ignore */ }
+  }
+</script>
+
+<!--
+  ═══════════════════════════════════════════════════════════════
+  CHANGES NEEDED IN THE REST OF index.html:
+  ═══════════════════════════════════════════════════════════════
+
+  1. In submitUpload() — after saveFileRecord(), add:
+     const backendFile = await adminSaveToBackend({title,category:cat,visibility:vis,desc}, selectedFileData);
+     if (backendFile) { /* optionally replace local record with backendFile.id */ }
+
+  2. In deleteFile(id) — before resourceStore filter, add:
+     await adminDeleteFromBackend(id);
+
+  3. In DOMContentLoaded — add:
+     await syncResourcesFromBackend();
+     // then renderPublicResources() uses updated resourceStore
+
+  ═══════════════════════════════════════════════════════════════
+  See README.md for the backend setup guide.
+  ═══════════════════════════════════════════════════════════════
+-->
